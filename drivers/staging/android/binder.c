@@ -224,6 +224,9 @@ struct binder_node {
 	
 	//prt和cookie分别指向一个用户空间地址，他们用来描述用户空间中一个Service组件
 	//cookie指向该Service组件的地址
+	//__user 表示是一个用户空间的指针，所以kernel不能直接使用（如copy等）。要使用copy_from_user，copy_to_user等函数进行操作
+	//详细参见：https://blog.csdn.net/q345852047/article/details/7710818
+	//另外 void *cookie 是void指针，参见：https://www.runoob.com/w3cnote/c-void-intro.html
 	void __user *cookie;
 	//指向该Service内部的一个引用计数对象（类型为weakref_impl）的地址
 	void __user *ptr;
@@ -390,44 +393,123 @@ struct binder_buffer {
 	
 };
 
+/**
+ * @brief 进程可延迟执行的工作项
+ * 
+ */
 enum {
+	//Binder驱动程序为进程分配内核缓冲区时，会为这个内核缓冲区创建一个文件描述符，进程可以通过这个文件描述符
+	//将该内核缓冲区映射到自己的地址空间。当进程不再需要使用Binder进程间通信机制时，他就会通知Binder驱动程序关闭该
+	//文件描述符，并且释放之前所分配的内核缓冲区。由于这不是一个马上就需要完成的操作，因此Binder驱动程序就会创建一个
+	//BINDER_DEFERRED_PUT_FILES类型的工作项来延迟执行该操作。
 	BINDER_DEFERRED_PUT_FILES    = 0x01,
+	//Binder线程池中的空闲Binder线程是睡眠在一个等待队列中的，进程可以通过调用函数flush来唤醒这些线程，以便他们可以检查
+	//进程是否有新的工作项需要处理。这时候Binder驱动程序就会创建一个BINDER_DEFERRED_FLUSH类型的工作项，以便可以延迟执行
+	//唤醒空闲Binder线程的操作。
 	BINDER_DEFERRED_FLUSH        = 0x02,
+	//当进程不再使用Binder进程间通信机制时，他就回调用函数close来关闭设备文件/dev/binder，这时候Binder驱动程序就会释放之前
+	//为他分配的资源，例如，释放进程结构体binder_proc、Binder实体对象结构体binder_node以及Binder引用对象结构体binder_ref
+	//等。由于资源释放是一个比较耗时的操作，因此，Binder驱动程序会创建一个BINDER_DEFERRED_RELEASE类型的事务来延迟执行他们
 	BINDER_DEFERRED_RELEASE      = 0x04,
 };
 
+/**
+ * @brief 描述一个正在使用Binder进程间通信机制的进程。
+ * 当一个进程调用函数open来打开设备文件/dev/binder时，Binder驱动程序就会为他创建一个binder_proc结构体，并且将他保存在一个全局的
+ * hash列表中，而成员变量proc_node就正好时该hash列表中的一个节点。
+ * 
+ */
 struct binder_proc {
+	//保存当前binder_proc的一个节点
 	struct hlist_node proc_node;
-	struct rb_root threads;
-	struct rb_root nodes;
-	struct rb_root refs_by_desc;
-	struct rb_root refs_by_node;
-	int pid;
-	struct vm_area_struct *vma;
-	struct task_struct *tsk;
-	struct files_struct *files;
-	struct hlist_node deferred_work_node;
-	int deferred_work;
-	void *buffer;
-	ptrdiff_t user_buffer_offset;
 
+	//进程的进程组ID
+	int pid;
+	//任务控制块
+	struct task_struct *tsk;
+	//打开文件结构体数组
+	struct files_struct *files;
+	
+	//Binder驱动程序为进程分配的内核缓冲区大小保存在成员变量buffer_size中
+	size_t buffer_size;
+	//内核空间地址，Binder驱动程序内部使用。
+	void *buffer;
+	//用户空间地址，应用程序进程内部使用
+	struct vm_area_struct *vma;
+	//内核空间地址和用户空间地址的差值。这样，给定一个用户空间地址或者一个内核空间地址，Binder驱动程序就可以计算出另外一个地址大小
+	ptrdiff_t user_buffer_offset;
+	//内核空间地址和用户空间地址都是虚拟地址，他们对应的物理页面保存在成员变量pages中。成员变量pages是类型为 struc page*的一个数组，
+	//数组中的每一个元素都执行一个物理页面。Binder驱动程序一开始只为该内核分配一个物理页面，后面不够使用时，再继续分配
+	//struct page **pages 代表一个page的二维数组
+	struct page **pages;
+
+	//buffer指向一块大的内核缓冲区，Binder驱动程序为了方便对他进行管理，会将他划分为若干个小块。
+	//这些小块的内核缓冲区就是使用前面介绍的binder_buffer来描述的，他们保存在一个列表中，按照地址值从小到大的顺序来排列。成员变量buffers
+	//便指向该列表的头部。
 	struct list_head buffers;
+	//列表中的小块内核缓冲区（binder_buffer）有的是正在使用的，即已经分配了物理页面；有的是空闲的，即还没有分配物理页面，他们分别组织在两个红黑树中，
+	//free_buffers：保存空闲binder_buffer的红黑树
 	struct rb_root free_buffers;
+	//allocated_buffers：保存已分配binder_buffer的红黑树
 	struct rb_root allocated_buffers;
+
+	//保存了空闲内核缓冲区的大小
+	uint32_t buffer_free;
+	//保存了当前可以用来保存异步事务数据的内核缓冲区的大小
 	size_t free_async_space;
 
-	struct page **pages;
-	size_t buffer_size;
-	uint32_t buffer_free;
-	struct list_head todo;
-	wait_queue_head_t wait;
-	struct binder_stats stats;
-	struct list_head delivered_death;
+	//每一个使用了Binder进程间通信机制的进程都有一个Binder线程池，用来处理进程间通信请求，这个Binder线程池是由Binder驱动程序来维护的。
+	//threads是一个红黑树的根节点，他以线程ID作为关键字来组织一个进程的Binder线程池。进程可以调用函数ioctl将一个线程注册到Binder驱动程序中，
+	//同时，当进程没有足够的空闲线程处理进程间通信请求时，Binder驱动程序也可以主动要求进程注册更多线程到Binder线程池中。Binder驱动程序最多
+	//可以主动要求进程注册的线程数量保存在成员变量max_threads中，而成员变量ready_threads表示进程当前的空闲Binder线程数目。
+	struct rb_root threads;
+	//Binder驱动程序可以主动要求进程注册的线程最大数量。max_threads并不是表示Binder线程池中的最大线程数目，进程本身可以主动注册任意数目
+	//的线程到Binder线程池中。
 	int max_threads;
+	//Binder驱动程序每一次主动请求进程注册一个线程时，都会将成员变量requested_threads的值+1
+	//而当进程响应这个请求之后，Binder驱动程序就会将成员变量requested_threads的值-1，而将requested_threads_starrted的值+1，
+	//表示Binder驱动程序已经主动请求进程注册了多少个线程到Bidner线程池中。
 	int requested_threads;
 	int requested_threads_started;
+	//当前进程空闲Binder线程数目
 	int ready_threads;
+
+	//当进程接收到一个进程间通信请求时，Binder驱动程序就将该请求封装成为一个工作项，并且加入到进程的待处理工作项队列中，这个队列用成员变量
+	//todo来描述
+	struct list_head todo;
+	//Binder线程池中空闲的Binder线程会睡眠在由成员变量wait所描述的一个等待队列中，当他们的宿主进程的待处理工作项队列增加了新的工作项之后
+	//Binder驱动程序就会唤醒这些线程，以便他们可以去处理新的工作项。
+	wait_queue_head_t wait;
+	//初始化进程的优先级。但一个线程处理一个工作项时，他的线程优先级可能会被设置为其宿主进程的优先级，即设置为成员变量default_priority的值，
+	//这是由于线程是代表其宿主进程来处理一个工作项。线程在处理一个工作项时的优先级还会收到其他因素的影响。
 	long default_priority;
+
+	//一个进程内部包含一系列的Binder实体对象和Binder引用对象，进程使用三个红黑树来组织他们
+	//nodes红黑树用来组织Binder实体对象，他以Binder实体对象的成员变量ptr作为关键字
+	struct rb_root nodes;
+	//refs_by_desc和refs_by_node所描述的红黑树是用来组织Binder引用对象的
+	//refs_by_desc以Binder引用对象的成员变量desc作为关键字
+	struct rb_root refs_by_desc;
+	//refs_by_node以Binder引用对象的成员变量node作为关键字
+	struct rb_root refs_by_node;
+
+	//deferred_work_node是一个hash列表，用来保存进程可以延迟执行的工作项。这些工作项有三种类型：
+	//BINDER_DEFERRED_PUT_FILES、BINDER_DEFERRED_FLUSH和BINDER_DEFERRED_RELEASE
+	//Binder驱动程序将所有延迟执行的工作保存在一个hash列表中。如果一个进程有延迟执行的工作项，
+	//那么deferred_work_node就刚好是该hash列表中的一个节点，并且使用成员变量deferred_work
+	//来描述该延迟工作项的具体类型
+	struct hlist_node deferred_work_node;
+	//延迟工作项的具体类型
+	int deferred_work;
+
+	//用于统计进程数据的，例如，进程间接受到的进程间通信请求次数
+	struct binder_stats stats;
+	//当一个进程引用的Service组件死亡时，Binder驱动程序就会向该进程发送一个死亡通知。这个正在发出的
+	//死亡通知被封装成一个BINDER_WORK_DEAD_BINDER或者BINDER_WORK_DEAD_BINDER_AND_CLEAR的工作项，
+	//并且保存在由成员变量delivered_death所描述的一个队列中，表示驱动程序正在向进程发送的死亡通知
+	//当进程接收到这个死亡通知之后，他便会通知Binder驱动程序，这时候Binder驱动程序就会将对应的工作项
+	//从成员变量delivered_death所描述的队列中删除
+	struct list_head delivered_death;
 };
 
 enum {
