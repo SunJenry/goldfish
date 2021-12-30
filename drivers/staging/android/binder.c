@@ -502,37 +502,80 @@ struct binder_proc {
 	//延迟工作项的具体类型
 	int deferred_work;
 
-	//用于统计进程数据的，例如，进程间接受到的进程间通信请求次数
+	//用于统计进程数据的，例如，进程间接受到的进程间通信请求次数。
 	struct binder_stats stats;
 	//当一个进程引用的Service组件死亡时，Binder驱动程序就会向该进程发送一个死亡通知。这个正在发出的
 	//死亡通知被封装成一个BINDER_WORK_DEAD_BINDER或者BINDER_WORK_DEAD_BINDER_AND_CLEAR的工作项，
 	//并且保存在由成员变量delivered_death所描述的一个队列中，表示驱动程序正在向进程发送的死亡通知
 	//当进程接收到这个死亡通知之后，他便会通知Binder驱动程序，这时候Binder驱动程序就会将对应的工作项
-	//从成员变量delivered_death所描述的队列中删除
+	//从成员变量delivered_death所描述的队列中删除。
 	struct list_head delivered_death;
 };
 
+/**
+ * @brief Binder线程状态取值
+ * 
+ */
 enum {
+	//一个线程注册到Binder驱动程序之后，他接着就会通过BC_REGISTER_LOOPER或者BC_ENTER_LOOPER
+	//协议来通知Binder驱动程序，他可以处理进程间通信请求了。这时候Binder驱动程序就会将他的状态设置为
+	//BINDER_LOOPER_STATE_REGISTERED或者BINDER_LOOPER_STATE_ENTERED
+	//如果一个线程是应用程序主动注册的，那么他就通过BC_ENTER_LOOPER协议来通知Binder驱动程序，他已经
+	//准备就绪处理进程间通信请求了。
 	BINDER_LOOPER_STATE_REGISTERED  = 0x01,
+	//如果一个线程是Binder驱动程序请求创建的，那么他就通过BC_REGISTER_LOOPER协议来通知Binder驱动程序，
+	//这时Binder驱动程序就会增加他所请求的进程创建的Binder线程的数目。
 	BINDER_LOOPER_STATE_ENTERED     = 0x02,
+	//当一个Binder线程退出时，他会通过BC_EXIT_LOOPER协议来通知Binder驱动程序，这时Binder驱动程序就会
+	//把他的状态设置为BINDER_LOOPER_STATE_EXITED。
 	BINDER_LOOPER_STATE_EXITED      = 0x04,
+	//异常情况下，一个Binder线程状态会被设置为BINDER_LOOPER_STATE_INVALID，例如，当线程已经处于
+	//BINDER_LOOPER_STATE_REGISTERED状态时，如果他又再次通过BC_ENTER_LOOPER协议来通知Binder
+	//驱动程序他已准备就绪了，那么Binder驱动程序就会将他的状态设置为BINDER_LOOPER_STATE_INVALID。
 	BINDER_LOOPER_STATE_INVALID     = 0x08,
+	//当一个Binder线程处于空闲状态时，Binder驱动程序就会把他的状态设置为BINDER_LOOPER_STATE_WAITING。
 	BINDER_LOOPER_STATE_WAITING     = 0x10,
+	//一个线程注册到Binder驱动程序时，Binder驱动程序就会为他创建一个binder_thread结构体，
+	//并且将他的状态初始化为 BINDER_LOOPER_STATE_NEED_RETURN，表示该线程马上需要返回到
+	//用户空间。由于一个线程在注册为Binder线程时可能还没准备好去处理进程间通信请求，因此，
+	//最好返回到用户空间中去做准备工作。此外，当进程调用函数flush来刷新他的Binder线程池时，
+	//Binder线程池中的线程的状态也会被重置为BINDER_LOOPERS_STATE_NEED_RETURN。
 	BINDER_LOOPER_STATE_NEED_RETURN = 0x20
 };
 
+/**
+ * @brief 描述Binder线程池中的一个线程
+ * 
+ */
 struct binder_thread {
+	//指向宿主进程
 	struct binder_proc *proc;
+	//前面在介绍进程结构体binder_proc时提到，进程结构体binder_proc使用一个红黑树来组织其Binder线程池中的线程，
+	//其中，结构体binder_thread的成员变量rb_node就是该红黑树中的一个节点
 	struct rb_node rb_node;
+	//pid用于描述一个Binder线程的ID
 	int pid;
+	//looper用于描述一个Binder线程的状态。详细定义见上面<Binder线程状态取值>
 	int looper;
-	struct binder_transaction *transaction_stack;
+	
+	//当一个来自Client进程的请求指定要由某一个Binder线程来处理时，这个请求就会加入到相应的binder_thread结构体
+	//成员变量todo所表示的队列中，并且唤醒这个线程来处理，因为这个线程可能处于睡眠状态。
 	struct list_head todo;
+
+	//当Binder驱动程序决定将一个事务交给一个Binder线程处理时，他就会将该事务封装成为一个binder_transaction
+	//结构体，并且将它添加到由线程结构体binder_thread的成员变量transaction_stack所描述的一个事务堆栈中。
+	//结构体binder_transaction设计很巧妙，后面我们再详细介绍他的定义
+	struct binder_transaction *transaction_stack;
+	//一个Binder线程在处理一个事务时，如果出现了异常情况，那么Binder驱动程序就会将相应的错误码保存在其成员变量
+	//return_error和return_error2中，这时候线程就会将这些错误返回给用户空间应用程序处理。
 	uint32_t return_error; /* Write failed, return error code in read buf */
 	uint32_t return_error2; /* Write failed, return error code in read */
 		/* buffer. Used when sending a reply to a dead process that */
 		/* we are also waiting on */
+	//当一个Binder线程在处理一个事务T1并需要依赖于其他的Binder线程来处理另外一个事务T2时，他就会睡眠在由成员变量
+	//wait所描述的一个等待队列中，知道事务T2处理完成为止。
 	wait_queue_head_t wait;
+	//用来统计Binder线程数据，例如，Binder线程接收到的进程间通信请求的次数。
 	struct binder_stats stats;
 };
 
