@@ -579,23 +579,54 @@ struct binder_thread {
 	struct binder_stats stats;
 };
 
+/**
+ * @brief 用来描述进程间通信，这个过程又称为一个事务
+ * 
+ */
 struct binder_transaction {
 	int debug_id;
-	struct binder_work work;
-	struct binder_thread *from;
-	struct binder_transaction *from_parent;
-	struct binder_proc *to_proc;
-	struct binder_thread *to_thread;
-	struct binder_transaction *to_parent;
-	unsigned need_reply : 1;
-	/*unsigned is_dead : 1;*/ /* not used at the moment */
 
+	//用来区分一个事务是同步的还是异步的。同步事务需要等待对方回复，这时候他的成员变量need_reply就是 1，否则就是0，
+	//表示这是一个异步事务不需要等待回复
+	unsigned need_reply : 1;
+
+	//指事务的发起线程，称为源线程
+	struct binder_thread *from;
+	//通过priority和sender_euid，目标进程就可以识别事务发起方的身份
+	//源线程的优先级
+	long	priority;
+	//源线程的用户ID
+	uid_t	sender_euid;
+
+	//负责处理该事务的进程，即目标进程
+	struct binder_proc *to_proc;
+	//负责处理该事务的线程，即目标线程
+	struct binder_thread *to_thread;
+
+	//一个线程在处理一个事务时，Binder驱动程序需要修改他的线程优先级，以便满足源线程和目标Service组件的要求。
+	//Binder驱动程序在修改一个线程的优先级之前，会将它原来的优先级保存在一个事务结构体的成员变量saved_priority中，
+	//以便线程处理完成该事务后可以恢复到原来的优先级。前面在介绍结构体binder_node时提到，目标线程在处理一个事务时，
+	//他的线程优先级不能低于目标Service组件所要求的线程优先级，而且也不能低于源线程的优先级。这时候Binder驱动程序
+	//就会将这二者中较大值设置为目标线程的优先级
+	long	saved_priority;
+
+	//指向Binder驱动程序为该事务分配的一块内核缓冲区，它里面保存了进程间通信数据。
 	struct binder_buffer *buffer;
+
+	//code和flags是直接从进程间通信数据中复制过来的，后面在介绍结构体binder_transaction_data时，再详细分析
 	unsigned int	code;
 	unsigned int	flags;
-	long	priority;
-	long	saved_priority;
-	uid_t	sender_euid;
+
+	//当Binder驱动程序为目标进程或者目标线程创建一个事务时，就会将该事务的成员变量work的值设置为
+	//BINDER_WORK_TRANSACTION，并且将它添加到目标进程或者目标线程的todo队列中去等待处理。
+	struct binder_work work;
+	
+	//一个事务所依赖的另外一个事务
+	struct binder_transaction *from_parent;
+	//目标线程的下一个需要处理的事务
+	struct binder_transaction *to_parent;
+	
+	/*unsigned is_dead : 1;*/ /* not used at the moment */
 };
 
 static void binder_defer_work(struct binder_proc *proc, int defer);
